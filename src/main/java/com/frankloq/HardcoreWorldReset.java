@@ -95,6 +95,9 @@ public class HardcoreWorldReset implements ModInitializer {
 		getResetExemptionService();
 		loadConfig();
 		getResetExemptionService().loadPlayerData();
+
+		DeathCounter.load();
+
 		ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
 
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
@@ -492,6 +495,8 @@ public class HardcoreWorldReset implements ModInitializer {
 					Text.literal("§7Erasing the world in §c5 §7seconds..."),
 					false
 			);
+
+			DeathCounter.increment(player.getUuid());
 
 			LOGGER.info("World reset sequence started. Countdown: 5 seconds.");
 
