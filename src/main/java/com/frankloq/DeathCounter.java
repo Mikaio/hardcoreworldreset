@@ -5,17 +5,19 @@ import net.fabricmc.loader.api.FabricLoader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 public class DeathCounter {
 
-    private static final Map<UUID, Integer> deaths = new HashMap<>();
+    private static final Map<UUID, DeathRecord> deaths = new HashMap<>();
 
     private static final Path DEATHS_FILE = FabricLoader.getInstance()
-            .getConfigDir()
-            .resolve("hardcoreworldreset-deaths.properties");
+        .getConfigDir()
+        .resolve("hardcoreworldreset-deaths.properties");
 
     public static void load() {
         deaths.clear();
@@ -30,19 +32,25 @@ public class DeathCounter {
                     continue;
                 }
 
-                String[] parts = line.split("=");
+                String[] parts = line.split("=", 3);
 
-                if (parts.length != 2) {
+                if (parts.length != 3) {
                     continue;
                 }
 
                 UUID uuid = UUID.fromString(parts[0]);
-                int count = Integer.parseInt(parts[1]);
+                String name = parts[1];
+                int count = Integer.parseInt(parts[2]);
 
-                deaths.put(uuid, count);
+                deaths.put(
+                    uuid,
+                    new DeathRecord(uuid, name, count)
+                );
             }
         } catch (IOException | IllegalArgumentException e) {
-            System.err.println("Failed to load death counter: " + e.getMessage());
+            System.err.println(
+                "Failed to load death counter: " + e.getMessage()
+            );
         }
     }
 
@@ -52,29 +60,55 @@ public class DeathCounter {
 
             StringBuilder content = new StringBuilder();
 
-            for (Map.Entry<UUID, Integer> entry : deaths.entrySet()) {
-                content.append(entry.getKey())
-                        .append("=")
-                        .append(entry.getValue())
-                        .append("\n");
+            for (DeathRecord record : deaths.values()) {
+                content.append(record.uuid())
+                    .append("=")
+                    .append(record.name())
+                    .append("=")
+                    .append(record.deaths())
+                    .append("\n");
             }
 
-            Files.writeString(DEATHS_FILE, content.toString());
+            Files.writeString(
+                DEATHS_FILE,
+                content.toString()
+            );
         } catch (IOException e) {
-            System.err.println("Failed to save death counter: " + e.getMessage());
+            System.err.println(
+                "Failed to save death counter: " + e.getMessage()
+            );
         }
     }
 
-    public static void increment(UUID uuid) {
-        deaths.merge(uuid, 1, Integer::sum);
+    public static void increment(UUID uuid, String name) {
+        DeathRecord current = deaths.get(uuid);
+
+        if (current == null) {
+            deaths.put(
+                uuid,
+                new DeathRecord(uuid, name, 1)
+            );
+        } else {
+            deaths.put(
+                uuid,
+                new DeathRecord(
+                    uuid,
+                    name,
+                    current.deaths() + 1
+                )
+            );
+        }
+
         save();
     }
 
     public static int getDeaths(UUID uuid) {
-        return deaths.getOrDefault(uuid, 0);
+        DeathRecord record = deaths.get(uuid);
+
+        return record == null ? 0 : record.deaths();
     }
 
-    public static Map<UUID, Integer> getAllDeaths() {
-        return new HashMap<>(deaths);
+    public static List<DeathRecord> getAllDeaths() {
+        return new ArrayList<>(deaths.values());
     }
 }

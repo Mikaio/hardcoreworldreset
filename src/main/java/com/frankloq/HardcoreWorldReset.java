@@ -7,6 +7,7 @@ import com.frankloq.reset.WorldResetManager;
 import com.frankloq.mixin.LivingEntityDropInvoker;
 import com.mojang.authlib.GameProfile;
 import me.lucko.fabric.api.permissions.v0.Permissions;
+import java.util.List;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
@@ -17,6 +18,7 @@ import static net.minecraft.server.command.CommandManager.literal;
 import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.network.packet.s2c.play.GameStateChangeS2CPacket;
 import net.minecraft.network.packet.s2c.play.HealthUpdateS2CPacket;
+import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -244,6 +246,14 @@ public class HardcoreWorldReset implements ModInitializer {
 										);
 										return 1;
 									})))
+			);
+
+			dispatcher.register(
+				literal("deaths")
+					.executes(context -> {
+						sendDeathRanking(context.getSource());
+						return 1;
+					})
 			);
 		});
 
@@ -496,7 +506,10 @@ public class HardcoreWorldReset implements ModInitializer {
 					false
 			);
 
-			DeathCounter.increment(player.getUuid());
+			DeathCounter.increment(
+				player.getUuid(),
+				player.getName().getString()
+			);
 
 			LOGGER.info("World reset sequence started. Countdown: 5 seconds.");
 
@@ -675,4 +688,53 @@ public class HardcoreWorldReset implements ModInitializer {
 		}
 	}
 
+
+	private static void sendDeathRanking(ServerCommandSource source) {
+		List<DeathRecord> ranking = DeathCounter.getAllDeaths();
+
+		if (ranking.isEmpty()) {
+			source.sendFeedback(
+				() -> Text.literal("§7Nenhuma morte registrada ainda."),
+				false
+			);
+
+			return;
+		}
+
+		ranking.sort(
+			(first, second) ->
+				Integer.compare(
+					second.deaths(),
+					first.deaths()
+				)
+		);
+
+		source.sendFeedback(
+			() -> Text.literal("§6===== Mortes ====="),
+			false
+		);
+
+		int position = 1;
+
+		for (DeathRecord record : ranking) {
+			Text message = Text.literal(
+				"§e" + position +
+				". §f" + record.name() +
+				" §7- §c" + record.deaths() +
+				(record.deaths() == 1 ? " morte" : " mortes")
+			);
+
+			source.sendFeedback(
+				() -> message,
+				false
+			);
+
+			position++;
+		}
+
+		source.sendFeedback(
+			() -> Text.literal("§6==================="),
+			false
+		);
+	}
 }
