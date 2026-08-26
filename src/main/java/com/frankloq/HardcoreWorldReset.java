@@ -1,21 +1,30 @@
 package com.frankloq;
 
+import com.frankloq.data.PlayerDataStore;
 import com.frankloq.reset.PlayerRespawner;
+import com.frankloq.reset.ResetExemptionService;
 import com.frankloq.reset.WorldResetManager;
+import com.frankloq.mixin.LivingEntityDropInvoker;
+import com.mojang.authlib.GameProfile;
+import me.lucko.fabric.api.permissions.v0.Permissions;
+import java.util.List;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.command.argument.GameProfileArgumentType;
 import static net.minecraft.server.command.CommandManager.literal;
 import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.network.packet.s2c.play.GameStateChangeS2CPacket;
 import net.minecraft.network.packet.s2c.play.HealthUpdateS2CPacket;
+import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.world.GameMode;
+import net.minecraft.world.GameRules;
 import net.minecraft.world.World;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,6 +33,9 @@ import static com.mojang.brigadier.arguments.IntegerArgumentType.getInteger;
 import static net.minecraft.server.command.CommandManager.argument;
 import static com.mojang.brigadier.arguments.BoolArgumentType.bool;
 import static com.mojang.brigadier.arguments.BoolArgumentType.getBool;
+
+import java.util.Collection;
+import java.util.List;
 
 public class HardcoreWorldReset implements ModInitializer {
 
@@ -40,8 +52,22 @@ public class HardcoreWorldReset implements ModInitializer {
 	private static boolean alwaysShowActionBar = false;
 	private static int actionBarDisplayTicks = 0; // Tracks the 5-second popup
 	private static final java.util.Map<net.minecraft.server.network.ServerPlayerEntity, Integer> rescueQueue = new java.util.HashMap<>();
+	private static ResetExemptionService resetExemptionService;
+	private static final String PERMISSION_EXEMPTIONS_ADD = "hardcoreworldreset.exemptions.add";
+	private static final String PERMISSION_EXEMPTIONS_REMOVE = "hardcoreworldreset.exemptions.remove";
+	private static final String PERMISSION_EXEMPTIONS_LIST = "hardcoreworldreset.exemptions.list";
+	private static final String PERMISSION_EXEMPTIONS_ENABLE = "hardcoreworldreset.exemptions.enable";
+	private static final String PERMISSION_EXEMPTIONS_DISABLE = "hardcoreworldreset.exemptions.disable";
 
 	public static boolean isModEnabled() { return modEnabled; }
+
+	private static ResetExemptionService getResetExemptionService() {
+		if (resetExemptionService == null) {
+			java.nio.file.Path configDirectory = net.fabricmc.loader.api.FabricLoader.getInstance().getConfigDir();
+			resetExemptionService = new ResetExemptionService(new PlayerDataStore(configDirectory, LOGGER), LOGGER);
+		}
+		return resetExemptionService;
+	}
 
 	public static boolean cancelCountdown(MinecraftServer server) {
 		boolean stopped = false;
@@ -68,6 +94,12 @@ public class HardcoreWorldReset implements ModInitializer {
 	@Override
 	public void onInitialize() {
 		LOGGER.info("HardcoreWorldReset initialized.");
+		getResetExemptionService();
+		loadConfig();
+		getResetExemptionService().loadPlayerData();
+
+		DeathCounter.load();
+
 		ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
 
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
@@ -76,6 +108,28 @@ public class HardcoreWorldReset implements ModInitializer {
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
 			dispatcher.register(literal("hwr")
+					.then(literal("exemptions")
+							.then(literal("add")
+									.requires(Permissions.require(PERMISSION_EXEMPTIONS_ADD, 2))
+									.then(argument("player", GameProfileArgumentType.gameProfile())
+											.executes(context -> addResetExemptions(
+													context.getSource(),
+													GameProfileArgumentType.getProfileArgument(context, "player")))))
+							.then(literal("remove")
+									.requires(Permissions.require(PERMISSION_EXEMPTIONS_REMOVE, 2))
+									.then(argument("player", GameProfileArgumentType.gameProfile())
+											.executes(context -> removeResetExemptions(
+													context.getSource(),
+													GameProfileArgumentType.getProfileArgument(context, "player")))))
+							.then(literal("on")
+									.requires(Permissions.require(PERMISSION_EXEMPTIONS_ENABLE, 2))
+									.executes(context -> setResetExemptionsEnabled(context.getSource(), true)))
+							.then(literal("off")
+									.requires(Permissions.require(PERMISSION_EXEMPTIONS_DISABLE, 2))
+									.executes(context -> setResetExemptionsEnabled(context.getSource(), false)))
+							.then(literal("list")
+									.requires(Permissions.require(PERMISSION_EXEMPTIONS_LIST, 2))
+									.executes(context -> listResetExemptions(context.getSource()))))
 
 					// stopCountdown (Aborts any active reset without turning off the mod)
 					.then(literal("stopCountdown")
@@ -193,11 +247,20 @@ public class HardcoreWorldReset implements ModInitializer {
 										return 1;
 									})))
 			);
+
+			dispatcher.register(
+				literal("deaths")
+					.executes(context -> {
+						sendDeathRanking(context.getSource());
+						return 1;
+					})
+			);
 		});
 
 		// Fix for player getting stuck in the Limbo if they leave after the DELETING phase
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
 			net.minecraft.server.network.ServerPlayerEntity player = handler.player;
+			getResetExemptionService().refreshTrackedPlayerName(player);
 
 			// Check if the player logging in is trapped in Limbo
 			if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
@@ -211,6 +274,64 @@ public class HardcoreWorldReset implements ModInitializer {
 				HardcoreWorldReset.LOGGER.info("Player " + player.getName().getString() + " detected in Limbo. Rescue arriving in 1 second...");
 			}
 		});
+	}
+
+	private static int addResetExemptions(
+			net.minecraft.server.command.ServerCommandSource source,
+			Collection<GameProfile> profiles) {
+		ResetExemptionService service = getResetExemptionService();
+		if (!service.isPlayerDataAvailable()) {
+			source.sendError(Text.literal("§c[Reset] Player data is invalid or unreadable. Fix hardcoreworldreset.data.json and restart the server before changing exemptions."));
+			return 0;
+		}
+
+		int changed = service.addExemptions(profiles);
+		source.sendFeedback(
+				() -> Text.literal("§a[Reset] §7" + changed + " player(s) added to reset exemptions."),
+				true
+		);
+		return changed;
+	}
+
+	private static int removeResetExemptions(
+			net.minecraft.server.command.ServerCommandSource source,
+			Collection<GameProfile> profiles) {
+		ResetExemptionService service = getResetExemptionService();
+		if (!service.isPlayerDataAvailable()) {
+			source.sendError(Text.literal("§c[Reset] Player data is invalid or unreadable. Fix hardcoreworldreset.data.json and restart the server before changing exemptions."));
+			return 0;
+		}
+
+		int changed = service.removeExemptions(profiles);
+		source.sendFeedback(
+				() -> Text.literal("§a[Reset] §7" + changed + " player(s) removed from reset exemptions."),
+				true
+		);
+		return changed;
+	}
+
+	private static int setResetExemptionsEnabled(net.minecraft.server.command.ServerCommandSource source, boolean enabled) {
+		getResetExemptionService().setEnabled(enabled);
+		saveConfig();
+		source.sendFeedback(
+				() -> Text.literal("§a[Reset] §7Reset exemptions are now " + (enabled ? "enabled" : "disabled") + "."),
+				true
+		);
+		return 1;
+	}
+
+	private static int listResetExemptions(net.minecraft.server.command.ServerCommandSource source) {
+		ResetExemptionService service = getResetExemptionService();
+		String state = service.isEnabled() ? "enabled" : "disabled";
+		List<String> exemptPlayers = service.listExemptions(source.getServer());
+		if (exemptPlayers.isEmpty()) {
+			source.sendFeedback(() -> Text.literal("§7[Reset] Reset exemptions are " + state + ". No players are exempt."), false);
+			return 0;
+		}
+
+		String players = String.join(", ", exemptPlayers);
+		source.sendFeedback(() -> Text.literal("§7[Reset] Reset exemptions are " + state + ": §e" + players), false);
+		return exemptPlayers.size();
 	}
 
 	private void onServerTick(MinecraftServer server) {
@@ -385,12 +506,40 @@ public class HardcoreWorldReset implements ModInitializer {
 					false
 			);
 
+			DeathCounter.increment(
+				player.getUuid(),
+				player.getName().getString()
+			);
+
 			LOGGER.info("World reset sequence started. Countdown: 5 seconds.");
 
 		} else {
 			// This runs for anyone else who dies while the countdown is already happening
 			player.sendMessage(Text.literal("§eA world reset is already in progress. Joining The Limbo..."), false);
 		}
+	}
+
+	public static boolean isResetExempt(ServerPlayerEntity player) {
+		return getResetExemptionService().isExempt(player);
+	}
+
+	public static void handleExemptHardcorePlayerDeath(ServerPlayerEntity player, DamageSource damageSource) {
+		MinecraftServer server = player.getServer();
+		if (server == null) {
+			return;
+		}
+
+		((LivingEntityDropInvoker) player).hardcoreworldreset$drop(player.getServerWorld(), damageSource);
+		player.setExperienceLevel(0);
+		player.setExperiencePoints(0);
+		player.experienceProgress = 0.0f;
+		player.totalExperience = 0;
+
+		if (player.getWorld().getGameRules().getBoolean(GameRules.SHOW_DEATH_MESSAGES)) {
+			server.getPlayerManager().broadcast(damageSource.getDeathMessage(player), false);
+		}
+		PlayerRespawner.respawnExemptPlayer(player, server);
+		LOGGER.info("Exempt Hardcore player {} died without starting a world reset.", player.getName().getString());
 	}
 
 	private static void executeLimboTeleport(MinecraftServer server) {
@@ -501,12 +650,15 @@ public class HardcoreWorldReset implements ModInitializer {
 					reuseSeed = Boolean.parseBoolean(reuse);
 					String showBar = props.getProperty("always-show-action-bar", "false");
 					alwaysShowActionBar = Boolean.parseBoolean(showBar);
+					getResetExemptionService().setEnabled(Boolean.parseBoolean(props.getProperty("reset-exemptions-enabled", "false")));
 
 					LOGGER.info("Loaded config: reuse-same-seed = " + reuseSeed + ", always-show-action-bar = " + alwaysShowActionBar);
 				}
 			} else {
 				// If it doesn't exist, create it with the default set to false
 				props.setProperty("reuse-same-seed", "false");
+				props.setProperty("always-show-action-bar", "false");
+				props.setProperty("reset-exemptions-enabled", "false");
 				try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 					props.store(out, "Hardcore World Reset Configuration");
 					LOGGER.info("Generated default config file.");
@@ -525,6 +677,7 @@ public class HardcoreWorldReset implements ModInitializer {
 
 			props.setProperty("reuse-same-seed", String.valueOf(reuseSeed));
 			props.setProperty("always-show-action-bar", String.valueOf(alwaysShowActionBar));
+			props.setProperty("reset-exemptions-enabled", String.valueOf(getResetExemptionService().isEnabled()));
 
 			try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 				props.store(out, "Hardcore World Reset Configuration");
@@ -533,5 +686,55 @@ public class HardcoreWorldReset implements ModInitializer {
 		} catch (Exception e) {
 			LOGGER.error("Failed to save config file!", e);
 		}
+	}
+
+
+	private static void sendDeathRanking(ServerCommandSource source) {
+		List<DeathRecord> ranking = DeathCounter.getAllDeaths();
+
+		if (ranking.isEmpty()) {
+			source.sendFeedback(
+				() -> Text.literal("§7Nenhuma morte registrada ainda."),
+				false
+			);
+
+			return;
+		}
+
+		ranking.sort(
+			(first, second) ->
+				Integer.compare(
+					second.deaths(),
+					first.deaths()
+				)
+		);
+
+		source.sendFeedback(
+			() -> Text.literal("§6===== Mortes ====="),
+			false
+		);
+
+		int position = 1;
+
+		for (DeathRecord record : ranking) {
+			Text message = Text.literal(
+				"§e" + position +
+				". §f" + record.name() +
+				" §7- §c" + record.deaths() +
+				(record.deaths() == 1 ? " morte" : " mortes")
+			);
+
+			source.sendFeedback(
+				() -> message,
+				false
+			);
+
+			position++;
+		}
+
+		source.sendFeedback(
+			() -> Text.literal("§6==================="),
+			false
+		);
 	}
 }
