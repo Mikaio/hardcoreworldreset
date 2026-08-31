@@ -3,6 +3,7 @@ package com.frankloq;
 import com.frankloq.data.PlayerDataStore;
 import com.frankloq.reset.PlayerRespawner;
 import com.frankloq.reset.ResetExemptionService;
+import com.frankloq.reset.RespawnProgressMode;
 import com.frankloq.reset.WorldResetManager;
 import com.frankloq.mixin.LivingEntityDropInvoker;
 import com.mojang.authlib.GameProfile;
@@ -45,6 +46,8 @@ public class HardcoreWorldReset implements ModInitializer {
 	private static boolean resetInProgress = false;
 	private static int limboCountdownTicks = -1;
 	private static boolean modEnabled = true;
+	private static final String CONFIG_MOD_ENABLED = "mod-enabled";
+	private static final boolean DEFAULT_MOD_ENABLED = true;
 	public static boolean reuseSeed = false; // Reuse the same seed for each reset.
 	private static boolean scheduledResetActive = false; // Flag to indicate if a reset is currently scheduled
 	private static int scheduledResetTicks = -1; // scheduled reset
@@ -58,6 +61,9 @@ public class HardcoreWorldReset implements ModInitializer {
 	private static final String PERMISSION_EXEMPTIONS_LIST = "hardcoreworldreset.exemptions.list";
 	private static final String PERMISSION_EXEMPTIONS_ENABLE = "hardcoreworldreset.exemptions.enable";
 	private static final String PERMISSION_EXEMPTIONS_DISABLE = "hardcoreworldreset.exemptions.disable";
+	private static final String PERMISSION_ENABLE = "hardcoreworldreset.enable";
+	private static final String PERMISSION_DISABLE = "hardcoreworldreset.disable";
+	private static final String PERMISSION_FORCE_SPECTATOR_RESPAWN = "hardcoreworldreset.force-spectator-respawn";
 
 	public static boolean isModEnabled() { return modEnabled; }
 
@@ -145,40 +151,33 @@ public class HardcoreWorldReset implements ModInitializer {
 								return 1;
 							}))
 
-					// 2. off (Disables the mod and aborts any active reset)
+					.then(literal("forceSpectatorRespawn")
+							.requires(Permissions.require(PERMISSION_FORCE_SPECTATOR_RESPAWN, 2))
+							.executes(context -> forceSpectatorRespawn(context.getSource(), RespawnProgressMode.PRESERVE))
+							.then(literal("preserve")
+									.executes(context -> forceSpectatorRespawn(context.getSource(), RespawnProgressMode.PRESERVE)))
+							.then(literal("reset")
+									.executes(context -> forceSpectatorRespawn(context.getSource(), RespawnProgressMode.RESET))))
+
+					// 2. off (Disables resets and aborts pending reset countdowns)
 					.then(literal("off")
-							.requires(source -> source.hasPermissionLevel(2))
-							.executes(context -> {
-								modEnabled = false;
-								boolean stopped = cancelCountdown(context.getSource().getServer());
+							.requires(Permissions.require(PERMISSION_DISABLE, 2))
+							.executes(context -> setModEnabled(context.getSource(), false)))
 
-								if (stopped) {
-									context.getSource().getServer().getPlayerManager().broadcast(
-											Text.literal("§c[Reset] §7Mod disabled and active reset aborted."), false
-									);
-								} else {
-									context.getSource().getServer().getPlayerManager().broadcast(
-											Text.literal("§c[Reset] §7Mod disabled. Deaths will no longer reset the world."), false
-									);
-								}
-								return 1;
-							}))
-
-					// 3. on (Enables the mod)
+					// 3. on (Enables resets)
 					.then(literal("on")
-							.requires(source -> source.hasPermissionLevel(2))
-							.executes(context -> {
-								modEnabled = true;
-								context.getSource().getServer().getPlayerManager().broadcast(
-										Text.literal("§a[Reset] §7Mod enabled. Hardcore resets are active!"), false
-								);
-								return 1;
-							}))
+							.requires(Permissions.require(PERMISSION_ENABLE, 2))
+							.executes(context -> setModEnabled(context.getSource(), true)))
 					// 4. startTimer (Sets a timer in minutes)
 					.then(literal("startTimer")
 							.requires(source -> source.hasPermissionLevel(2))
 							.then(argument("minutes", integer(1))
 									.executes(context -> {
+										if (!modEnabled) {
+											context.getSource().sendError(Text.literal("§c[Reset] §7Hardcore resets are disabled."));
+											return 0;
+										}
+
 										int mins = getInteger(context, "minutes");
 
 										// Save the initial time into memory
@@ -334,8 +333,68 @@ public class HardcoreWorldReset implements ModInitializer {
 		return exemptPlayers.size();
 	}
 
+	private static int setModEnabled(ServerCommandSource source, boolean enabled) {
+		MinecraftServer server = source.getServer();
+		boolean resetPipelineActive = WorldResetManager.isResetting();
+		boolean pendingReset = resetInProgress && limboCountdownTicks > 0
+				|| scheduledResetActive || initialScheduledMinutes > 0;
+
+		modEnabled = enabled;
+		boolean stopped = !enabled && cancelCountdown(server);
+		saveConfig();
+
+		if (enabled) {
+			server.getPlayerManager().broadcast(
+					Text.literal("§a[Reset] §7Mod enabled. Hardcore resets are active!"), false
+			);
+			return 1;
+		}
+
+		String message;
+		if (resetPipelineActive) {
+			message = "§c[Reset] §7Mod disabled. The active world reset will finish; future resets are disabled.";
+		} else if (stopped && pendingReset) {
+			message = "§c[Reset] §7Mod disabled and pending reset canceled.";
+		} else {
+			message = "§c[Reset] §7Mod disabled. Deaths will no longer reset the world.";
+		}
+
+		server.getPlayerManager().broadcast(Text.literal(message), false);
+		return 1;
+	}
+
+	private static int forceSpectatorRespawn(
+			ServerCommandSource source,
+			RespawnProgressMode progressMode) {
+		MinecraftServer server = source.getServer();
+		if (resetInProgress || scheduledResetActive || initialScheduledMinutes > 0 || WorldResetManager.isResetting()) {
+			source.sendError(Text.literal("§c[Reset] §7Cannot force spectator respawn while a reset is active or scheduled."));
+			return 0;
+		}
+
+		int respawned = PlayerRespawner.respawnSpectatorPlayers(server, progressMode);
+		if (respawned == 0) {
+			source.sendFeedback(
+					() -> Text.literal("§7[Reset] No online spectator players need respawning."),
+					false
+			);
+			return 0;
+		}
+
+		String mode = progressMode == RespawnProgressMode.RESET ? "reset" : "preserved";
+		source.sendFeedback(
+				() -> Text.literal("§a[Reset] §7Respawned " + respawned + " spectator player(s); progress was " + mode + "."),
+				true
+		);
+		return respawned;
+	}
+
 	private void onServerTick(MinecraftServer server) {
 		// Scheduled reset logic
+		if (!modEnabled && scheduledResetActive) {
+			cancelCountdown(server);
+		}
+
 		if (scheduledResetActive && scheduledResetTicks > 0) {
 			scheduledResetTicks--;
 
@@ -383,8 +442,11 @@ public class HardcoreWorldReset implements ModInitializer {
 				scheduledResetActive = false;
 
 				// Try to lock the reset (prevents double-resets if someone dies at the exact same millisecond)
-				if (WorldResetManager.tryLockCountdown()) {
+				if (modEnabled && WorldResetManager.tryLockCountdown()) {
 					executeLimboTeleport(server);
+				} else if (!modEnabled) {
+					scheduledResetTicks = -1;
+					initialScheduledMinutes = -1;
 				}
 			}
 		}
@@ -538,11 +600,19 @@ public class HardcoreWorldReset implements ModInitializer {
 		if (player.getWorld().getGameRules().getBoolean(GameRules.SHOW_DEATH_MESSAGES)) {
 			server.getPlayerManager().broadcast(damageSource.getDeathMessage(player), false);
 		}
-		PlayerRespawner.respawnExemptPlayer(player, server);
+		PlayerRespawner.respawnPlayerAtPreferredSpawn(player, server, RespawnProgressMode.PRESERVE);
 		LOGGER.info("Exempt Hardcore player {} died without starting a world reset.", player.getName().getString());
 	}
 
 	private static void executeLimboTeleport(MinecraftServer server) {
+		if (!modEnabled) {
+			resetInProgress = false;
+			limboCountdownTicks = -1;
+			WorldResetManager.unlockCountdown();
+			LOGGER.info("Skipping world reset because hardcore resets are disabled.");
+			return;
+		}
+
 		LOGGER.info("Teleporting all players to Limbo...");
 
 		int successCount = 0;
@@ -618,8 +688,8 @@ public class HardcoreWorldReset implements ModInitializer {
 				false
 		);
 
-		// Restarting the timer
-		if (initialScheduledMinutes > 0) {
+		// Restart the recurring timer only while resets remain enabled.
+		if (modEnabled && initialScheduledMinutes > 0) {
 			// Reset the clock to the maximum time
 			scheduledResetTicks = initialScheduledMinutes * 60 * 20;
 			scheduledResetActive = true;
@@ -632,7 +702,32 @@ public class HardcoreWorldReset implements ModInitializer {
 					Text.literal("§e[Reset] §7The clock is ticking! Next reset in §c" + initialScheduledMinutes + "§7 minutes."),
 					false
 			);
+		} else if (!modEnabled) {
+			scheduledResetActive = false;
+			scheduledResetTicks = -1;
+			initialScheduledMinutes = -1;
 		}
+	}
+
+	private static boolean parseBooleanProperty(
+			java.util.Properties props,
+			String key,
+			boolean defaultValue) {
+		String value = props.getProperty(key);
+		if (value == null) {
+			return defaultValue;
+		}
+
+		String normalized = value.trim();
+		if ("true".equalsIgnoreCase(normalized)) {
+			return true;
+		}
+		if ("false".equalsIgnoreCase(normalized)) {
+			return false;
+		}
+
+		LOGGER.warn("Invalid boolean value for '{}': '{}'. Using default {}.", key, value, defaultValue);
+		return defaultValue;
 	}
 
 	public static void loadConfig() {
@@ -644,21 +739,36 @@ public class HardcoreWorldReset implements ModInitializer {
 
 			if (java.nio.file.Files.exists(configFile)) {
 				// If config exists, read it
+				boolean hasModEnabledProperty;
 				try (java.io.InputStream in = java.nio.file.Files.newInputStream(configFile)) {
 					props.load(in);
 					String reuse = props.getProperty("reuse-same-seed", "true");
 					reuseSeed = Boolean.parseBoolean(reuse);
 					String showBar = props.getProperty("always-show-action-bar", "false");
 					alwaysShowActionBar = Boolean.parseBoolean(showBar);
+					modEnabled = parseBooleanProperty(props, CONFIG_MOD_ENABLED, DEFAULT_MOD_ENABLED);
 					getResetExemptionService().setEnabled(Boolean.parseBoolean(props.getProperty("reset-exemptions-enabled", "false")));
+					hasModEnabledProperty = props.containsKey(CONFIG_MOD_ENABLED);
 
-					LOGGER.info("Loaded config: reuse-same-seed = " + reuseSeed + ", always-show-action-bar = " + alwaysShowActionBar);
+					LOGGER.info("Loaded config: reuse-same-seed = " + reuseSeed
+							+ ", always-show-action-bar = " + alwaysShowActionBar
+							+ ", mod-enabled = " + modEnabled);
+				}
+
+				if (!hasModEnabledProperty) {
+					props.setProperty(CONFIG_MOD_ENABLED, String.valueOf(DEFAULT_MOD_ENABLED));
+					try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
+						props.store(out, "Hardcore World Reset Configuration");
+						LOGGER.info("Added default config property: mod-enabled = {}", DEFAULT_MOD_ENABLED);
+					}
 				}
 			} else {
-				// If it doesn't exist, create it with the default set to false
+				// If it doesn't exist, create it with the default values
+				modEnabled = DEFAULT_MOD_ENABLED;
 				props.setProperty("reuse-same-seed", "false");
 				props.setProperty("always-show-action-bar", "false");
 				props.setProperty("reset-exemptions-enabled", "false");
+				props.setProperty(CONFIG_MOD_ENABLED, String.valueOf(DEFAULT_MOD_ENABLED));
 				try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 					props.store(out, "Hardcore World Reset Configuration");
 					LOGGER.info("Generated default config file.");
@@ -678,6 +788,7 @@ public class HardcoreWorldReset implements ModInitializer {
 			props.setProperty("reuse-same-seed", String.valueOf(reuseSeed));
 			props.setProperty("always-show-action-bar", String.valueOf(alwaysShowActionBar));
 			props.setProperty("reset-exemptions-enabled", String.valueOf(getResetExemptionService().isEnabled()));
+			props.setProperty(CONFIG_MOD_ENABLED, String.valueOf(modEnabled));
 
 			try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 				props.store(out, "Hardcore World Reset Configuration");

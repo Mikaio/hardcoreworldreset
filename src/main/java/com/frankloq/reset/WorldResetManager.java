@@ -102,6 +102,11 @@ public class WorldResetManager {
 
     public static void beginReset(MinecraftServer server) {
         if (currentPhase != ResetPhase.IDLE) return;
+        if (!HardcoreWorldReset.isModEnabled()) {
+            countdownLocked = false;
+            HardcoreWorldReset.LOGGER.info("Skipping world reset because hardcore resets are disabled.");
+            return;
+        }
 
         Long fixedSeed = getFixedSeed(server);
         if (fixedSeed != null) {
